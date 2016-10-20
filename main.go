@@ -91,6 +91,7 @@ func main() {
 		},
 	}
 	app.Commands = []cli.Command{
+		attachCommand,
 		checkpointCommand,
 		createCommand,
 		deleteCommand,
