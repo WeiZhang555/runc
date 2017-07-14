@@ -9,18 +9,19 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/opencontainers/runc/libcontainer/configs"
 	"github.com/opencontainers/runc/libcontainer/seccomp"
 	libcontainerUtils "github.com/opencontainers/runc/libcontainer/utils"
 	"github.com/opencontainers/runtime-spec/specs-go"
+
+	"golang.org/x/sys/unix"
 )
 
 const wildcard = -1
 
-var namespaceMapping = map[specs.NamespaceType]configs.NamespaceType{
+var namespaceMapping = map[specs.LinuxNamespaceType]configs.NamespaceType{
 	specs.PIDNamespace:     configs.NEWPID,
 	specs.NetworkNamespace: configs.NEWNET,
 	specs.MountNamespace:   configs.NEWNS,
@@ -30,13 +31,13 @@ var namespaceMapping = map[specs.NamespaceType]configs.NamespaceType{
 }
 
 var mountPropagationMapping = map[string]int{
-	"rprivate": syscall.MS_PRIVATE | syscall.MS_REC,
-	"private":  syscall.MS_PRIVATE,
-	"rslave":   syscall.MS_SLAVE | syscall.MS_REC,
-	"slave":    syscall.MS_SLAVE,
-	"rshared":  syscall.MS_SHARED | syscall.MS_REC,
-	"shared":   syscall.MS_SHARED,
-	"":         syscall.MS_PRIVATE | syscall.MS_REC,
+	"rprivate": unix.MS_PRIVATE | unix.MS_REC,
+	"private":  unix.MS_PRIVATE,
+	"rslave":   unix.MS_SLAVE | unix.MS_REC,
+	"slave":    unix.MS_SLAVE,
+	"rshared":  unix.MS_SHARED | unix.MS_REC,
+	"shared":   unix.MS_SHARED,
+	"":         unix.MS_PRIVATE | unix.MS_REC,
 }
 
 var allowedDevices = []*configs.Device{
@@ -145,6 +146,7 @@ type CreateOpts struct {
 	NoPivotRoot      bool
 	NoNewKeyring     bool
 	Spec             *specs.Spec
+	Rootless         bool
 }
 
 // CreateLibcontainerConfig creates a new libcontainer configuration from a
@@ -175,6 +177,7 @@ func CreateLibcontainerConfig(opts *CreateOpts) (*configs.Config, error) {
 		Hostname:     spec.Hostname,
 		Labels:       append(labels, fmt.Sprintf("bundle=%s", cwd)),
 		NoNewKeyring: opts.NoNewKeyring,
+		Rootless:     opts.Rootless,
 	}
 
 	exists := false
@@ -208,7 +211,7 @@ func CreateLibcontainerConfig(opts *CreateOpts) (*configs.Config, error) {
 	if err := setupUserNamespace(spec, config); err != nil {
 		return nil, err
 	}
-	c, err := createCgroupConfig(opts.CgroupName, opts.UseSystemdCgroup, spec)
+	c, err := createCgroupConfig(opts)
 	if err != nil {
 		return nil, err
 	}
@@ -227,8 +230,17 @@ func CreateLibcontainerConfig(opts *CreateOpts) (*configs.Config, error) {
 		config.ProcessLabel = spec.Process.SelinuxLabel
 	}
 	config.Sysctl = spec.Linux.Sysctl
-	if spec.Linux.Resources != nil && spec.Linux.Resources.OOMScoreAdj != nil {
-		config.OomScoreAdj = *spec.Linux.Resources.OOMScoreAdj
+	if spec.Process != nil && spec.Process.OOMScoreAdj != nil {
+		config.OomScoreAdj = *spec.Process.OOMScoreAdj
+	}
+	if spec.Process.Capabilities != nil {
+		config.Capabilities = &configs.Capabilities{
+			Bounding:    spec.Process.Capabilities.Bounding,
+			Effective:   spec.Process.Capabilities.Effective,
+			Permitted:   spec.Process.Capabilities.Permitted,
+			Inheritable: spec.Process.Capabilities.Inheritable,
+			Ambient:     spec.Process.Capabilities.Ambient,
+		}
 	}
 	createHooks(spec, config)
 	config.MountLabel = spec.Linux.MountLabel
@@ -255,17 +267,23 @@ func createLibcontainerMount(cwd string, m specs.Mount) *configs.Mount {
 	}
 }
 
-func createCgroupConfig(name string, useSystemdCgroup bool, spec *specs.Spec) (*configs.Cgroup, error) {
-	var myCgroupPath string
+func createCgroupConfig(opts *CreateOpts) (*configs.Cgroup, error) {
+	var (
+		myCgroupPath string
+
+		spec             = opts.Spec
+		useSystemdCgroup = opts.UseSystemdCgroup
+		name             = opts.CgroupName
+	)
 
 	c := &configs.Cgroup{
 		Resources: &configs.Resources{},
 	}
 
-	if spec.Linux != nil && spec.Linux.CgroupsPath != nil {
-		myCgroupPath = libcontainerUtils.CleanPath(*spec.Linux.CgroupsPath)
+	if spec.Linux != nil && spec.Linux.CgroupsPath != "" {
+		myCgroupPath = libcontainerUtils.CleanPath(spec.Linux.CgroupsPath)
 		if useSystemdCgroup {
-			myCgroupPath = *spec.Linux.CgroupsPath
+			myCgroupPath = spec.Linux.CgroupsPath
 		}
 	}
 
@@ -292,9 +310,14 @@ func createCgroupConfig(name string, useSystemdCgroup bool, spec *specs.Spec) (*
 		c.Path = myCgroupPath
 	}
 
-	c.Resources.AllowedDevices = allowedDevices
-	if spec.Linux == nil {
-		return c, nil
+	// In rootless containers, any attempt to make cgroup changes will fail.
+	// libcontainer will validate this and we shouldn't add any cgroup options
+	// the user didn't specify.
+	if !opts.Rootless {
+		c.Resources.AllowedDevices = allowedDevices
+		if spec.Linux == nil {
+			return c, nil
+		}
 	}
 	r := spec.Linux.Resources
 	if r == nil {
@@ -306,8 +329,8 @@ func createCgroupConfig(name string, useSystemdCgroup bool, spec *specs.Spec) (*
 			major = int64(-1)
 			minor = int64(-1)
 		)
-		if d.Type != nil {
-			t = *d.Type
+		if d.Type != "" {
+			t = d.Type
 		}
 		if d.Major != nil {
 			major = *d.Major
@@ -315,10 +338,10 @@ func createCgroupConfig(name string, useSystemdCgroup bool, spec *specs.Spec) (*
 		if d.Minor != nil {
 			minor = *d.Minor
 		}
-		if d.Access == nil || *d.Access == "" {
+		if d.Access == "" {
 			return nil, fmt.Errorf("device access at %d field cannot be empty", i)
 		}
-		dt, err := stringToDeviceRune(t)
+		dt, err := stringToCgroupDeviceRune(t)
 		if err != nil {
 			return nil, err
 		}
@@ -326,59 +349,60 @@ func createCgroupConfig(name string, useSystemdCgroup bool, spec *specs.Spec) (*
 			Type:        dt,
 			Major:       major,
 			Minor:       minor,
-			Permissions: *d.Access,
+			Permissions: d.Access,
 			Allow:       d.Allow,
 		}
 		c.Resources.Devices = append(c.Resources.Devices, dd)
 	}
-	// append the default allowed devices to the end of the list
-	c.Resources.Devices = append(c.Resources.Devices, allowedDevices...)
+	if !opts.Rootless {
+		// append the default allowed devices to the end of the list
+		c.Resources.Devices = append(c.Resources.Devices, allowedDevices...)
+	}
 	if r.Memory != nil {
 		if r.Memory.Limit != nil {
-			c.Resources.Memory = int64(*r.Memory.Limit)
+			c.Resources.Memory = *r.Memory.Limit
 		}
 		if r.Memory.Reservation != nil {
-			c.Resources.MemoryReservation = int64(*r.Memory.Reservation)
+			c.Resources.MemoryReservation = *r.Memory.Reservation
 		}
 		if r.Memory.Swap != nil {
-			c.Resources.MemorySwap = int64(*r.Memory.Swap)
+			c.Resources.MemorySwap = *r.Memory.Swap
 		}
 		if r.Memory.Kernel != nil {
-			c.Resources.KernelMemory = int64(*r.Memory.Kernel)
+			c.Resources.KernelMemory = *r.Memory.Kernel
 		}
 		if r.Memory.KernelTCP != nil {
-			c.Resources.KernelMemoryTCP = int64(*r.Memory.KernelTCP)
+			c.Resources.KernelMemoryTCP = *r.Memory.KernelTCP
 		}
 		if r.Memory.Swappiness != nil {
-			swappiness := int64(*r.Memory.Swappiness)
-			c.Resources.MemorySwappiness = &swappiness
+			c.Resources.MemorySwappiness = r.Memory.Swappiness
 		}
 	}
 	if r.CPU != nil {
 		if r.CPU.Shares != nil {
-			c.Resources.CpuShares = int64(*r.CPU.Shares)
+			c.Resources.CpuShares = *r.CPU.Shares
 		}
 		if r.CPU.Quota != nil {
-			c.Resources.CpuQuota = int64(*r.CPU.Quota)
+			c.Resources.CpuQuota = *r.CPU.Quota
 		}
 		if r.CPU.Period != nil {
-			c.Resources.CpuPeriod = int64(*r.CPU.Period)
+			c.Resources.CpuPeriod = *r.CPU.Period
 		}
 		if r.CPU.RealtimeRuntime != nil {
-			c.Resources.CpuRtRuntime = int64(*r.CPU.RealtimeRuntime)
+			c.Resources.CpuRtRuntime = *r.CPU.RealtimeRuntime
 		}
 		if r.CPU.RealtimePeriod != nil {
-			c.Resources.CpuRtPeriod = int64(*r.CPU.RealtimePeriod)
+			c.Resources.CpuRtPeriod = *r.CPU.RealtimePeriod
 		}
-		if r.CPU.Cpus != nil {
-			c.Resources.CpusetCpus = *r.CPU.Cpus
+		if r.CPU.Cpus != "" {
+			c.Resources.CpusetCpus = r.CPU.Cpus
 		}
-		if r.CPU.Mems != nil {
-			c.Resources.CpusetMems = *r.CPU.Mems
+		if r.CPU.Mems != "" {
+			c.Resources.CpusetMems = r.CPU.Mems
 		}
 	}
-	if r.Pids != nil && r.Pids.Limit != nil {
-		c.Resources.PidsLimit = *r.Pids.Limit
+	if r.Pids != nil {
+		c.Resources.PidsLimit = r.Pids.Limit
 	}
 	if r.BlockIO != nil {
 		if r.BlockIO.Weight != nil {
@@ -402,52 +426,37 @@ func createCgroupConfig(name string, useSystemdCgroup bool, spec *specs.Spec) (*
 		}
 		if r.BlockIO.ThrottleReadBpsDevice != nil {
 			for _, td := range r.BlockIO.ThrottleReadBpsDevice {
-				var rate uint64
-				if td.Rate != nil {
-					rate = *td.Rate
-				}
+				rate := td.Rate
 				throttleDevice := configs.NewThrottleDevice(td.Major, td.Minor, rate)
 				c.Resources.BlkioThrottleReadBpsDevice = append(c.Resources.BlkioThrottleReadBpsDevice, throttleDevice)
 			}
 		}
 		if r.BlockIO.ThrottleWriteBpsDevice != nil {
 			for _, td := range r.BlockIO.ThrottleWriteBpsDevice {
-				var rate uint64
-				if td.Rate != nil {
-					rate = *td.Rate
-				}
+				rate := td.Rate
 				throttleDevice := configs.NewThrottleDevice(td.Major, td.Minor, rate)
 				c.Resources.BlkioThrottleWriteBpsDevice = append(c.Resources.BlkioThrottleWriteBpsDevice, throttleDevice)
 			}
 		}
 		if r.BlockIO.ThrottleReadIOPSDevice != nil {
 			for _, td := range r.BlockIO.ThrottleReadIOPSDevice {
-				var rate uint64
-				if td.Rate != nil {
-					rate = *td.Rate
-				}
+				rate := td.Rate
 				throttleDevice := configs.NewThrottleDevice(td.Major, td.Minor, rate)
 				c.Resources.BlkioThrottleReadIOPSDevice = append(c.Resources.BlkioThrottleReadIOPSDevice, throttleDevice)
 			}
 		}
 		if r.BlockIO.ThrottleWriteIOPSDevice != nil {
 			for _, td := range r.BlockIO.ThrottleWriteIOPSDevice {
-				var rate uint64
-				if td.Rate != nil {
-					rate = *td.Rate
-				}
+				rate := td.Rate
 				throttleDevice := configs.NewThrottleDevice(td.Major, td.Minor, rate)
 				c.Resources.BlkioThrottleWriteIOPSDevice = append(c.Resources.BlkioThrottleWriteIOPSDevice, throttleDevice)
 			}
 		}
 	}
 	for _, l := range r.HugepageLimits {
-		if l.Pagesize == nil || l.Limit == nil {
-			return nil, fmt.Errorf("pagesize and limit can not be empty")
-		}
 		c.Resources.HugetlbLimit = append(c.Resources.HugetlbLimit, &configs.HugepageLimit{
-			Pagesize: *l.Pagesize,
-			Limit:    *l.Limit,
+			Pagesize: l.Pagesize,
+			Limit:    l.Limit,
 		})
 	}
 	if r.DisableOOMKiller != nil {
@@ -467,10 +476,25 @@ func createCgroupConfig(name string, useSystemdCgroup bool, spec *specs.Spec) (*
 	return c, nil
 }
 
-func stringToDeviceRune(s string) (rune, error) {
+func stringToCgroupDeviceRune(s string) (rune, error) {
 	switch s {
 	case "a":
 		return 'a', nil
+	case "b":
+		return 'b', nil
+	case "c":
+		return 'c', nil
+	default:
+		return 0, fmt.Errorf("invalid cgroup device type %q", s)
+	}
+}
+
+func stringToDeviceRune(s string) (rune, error) {
+	switch s {
+	case "p":
+		return 'p', nil
+	case "u":
+		return 'u', nil
 	case "b":
 		return 'b', nil
 	case "c":
@@ -574,7 +598,7 @@ func setupUserNamespace(spec *specs.Spec, config *configs.Config) error {
 	if len(spec.Linux.UIDMappings) == 0 {
 		return nil
 	}
-	create := func(m specs.IDMapping) configs.IDMap {
+	create := func(m specs.LinuxIDMapping) configs.IDMap {
 		return configs.IDMap{
 			HostID:      int(m.HostID),
 			ContainerID: int(m.ContainerID),
@@ -587,11 +611,11 @@ func setupUserNamespace(spec *specs.Spec, config *configs.Config) error {
 	for _, m := range spec.Linux.GIDMappings {
 		config.GidMappings = append(config.GidMappings, create(m))
 	}
-	rootUID, err := config.HostUID()
+	rootUID, err := config.HostRootUID()
 	if err != nil {
 		return err
 	}
-	rootGID, err := config.HostGID()
+	rootGID, err := config.HostRootGID()
 	if err != nil {
 		return err
 	}
@@ -615,41 +639,49 @@ func parseMountOptions(options []string) (int, []int, string, int) {
 		clear bool
 		flag  int
 	}{
-		"async":         {true, syscall.MS_SYNCHRONOUS},
-		"atime":         {true, syscall.MS_NOATIME},
-		"bind":          {false, syscall.MS_BIND},
+		"acl":           {false, unix.MS_POSIXACL},
+		"async":         {true, unix.MS_SYNCHRONOUS},
+		"atime":         {true, unix.MS_NOATIME},
+		"bind":          {false, unix.MS_BIND},
 		"defaults":      {false, 0},
-		"dev":           {true, syscall.MS_NODEV},
-		"diratime":      {true, syscall.MS_NODIRATIME},
-		"dirsync":       {false, syscall.MS_DIRSYNC},
-		"exec":          {true, syscall.MS_NOEXEC},
-		"mand":          {false, syscall.MS_MANDLOCK},
-		"noatime":       {false, syscall.MS_NOATIME},
-		"nodev":         {false, syscall.MS_NODEV},
-		"nodiratime":    {false, syscall.MS_NODIRATIME},
-		"noexec":        {false, syscall.MS_NOEXEC},
-		"nomand":        {true, syscall.MS_MANDLOCK},
-		"norelatime":    {true, syscall.MS_RELATIME},
-		"nostrictatime": {true, syscall.MS_STRICTATIME},
-		"nosuid":        {false, syscall.MS_NOSUID},
-		"rbind":         {false, syscall.MS_BIND | syscall.MS_REC},
-		"relatime":      {false, syscall.MS_RELATIME},
-		"remount":       {false, syscall.MS_REMOUNT},
-		"ro":            {false, syscall.MS_RDONLY},
-		"rw":            {true, syscall.MS_RDONLY},
-		"strictatime":   {false, syscall.MS_STRICTATIME},
-		"suid":          {true, syscall.MS_NOSUID},
-		"sync":          {false, syscall.MS_SYNCHRONOUS},
+		"dev":           {true, unix.MS_NODEV},
+		"diratime":      {true, unix.MS_NODIRATIME},
+		"dirsync":       {false, unix.MS_DIRSYNC},
+		"exec":          {true, unix.MS_NOEXEC},
+		"iversion":      {false, unix.MS_I_VERSION},
+		"lazytime":      {false, unix.MS_LAZYTIME},
+		"loud":          {true, unix.MS_SILENT},
+		"mand":          {false, unix.MS_MANDLOCK},
+		"noacl":         {true, unix.MS_POSIXACL},
+		"noatime":       {false, unix.MS_NOATIME},
+		"nodev":         {false, unix.MS_NODEV},
+		"nodiratime":    {false, unix.MS_NODIRATIME},
+		"noexec":        {false, unix.MS_NOEXEC},
+		"noiversion":    {true, unix.MS_I_VERSION},
+		"nolazytime":    {true, unix.MS_LAZYTIME},
+		"nomand":        {true, unix.MS_MANDLOCK},
+		"norelatime":    {true, unix.MS_RELATIME},
+		"nostrictatime": {true, unix.MS_STRICTATIME},
+		"nosuid":        {false, unix.MS_NOSUID},
+		"rbind":         {false, unix.MS_BIND | unix.MS_REC},
+		"relatime":      {false, unix.MS_RELATIME},
+		"remount":       {false, unix.MS_REMOUNT},
+		"ro":            {false, unix.MS_RDONLY},
+		"rw":            {true, unix.MS_RDONLY},
+		"silent":        {false, unix.MS_SILENT},
+		"strictatime":   {false, unix.MS_STRICTATIME},
+		"suid":          {true, unix.MS_NOSUID},
+		"sync":          {false, unix.MS_SYNCHRONOUS},
 	}
 	propagationFlags := map[string]int{
-		"private":     syscall.MS_PRIVATE,
-		"shared":      syscall.MS_SHARED,
-		"slave":       syscall.MS_SLAVE,
-		"unbindable":  syscall.MS_UNBINDABLE,
-		"rprivate":    syscall.MS_PRIVATE | syscall.MS_REC,
-		"rshared":     syscall.MS_SHARED | syscall.MS_REC,
-		"rslave":      syscall.MS_SLAVE | syscall.MS_REC,
-		"runbindable": syscall.MS_UNBINDABLE | syscall.MS_REC,
+		"private":     unix.MS_PRIVATE,
+		"shared":      unix.MS_SHARED,
+		"slave":       unix.MS_SLAVE,
+		"unbindable":  unix.MS_UNBINDABLE,
+		"rprivate":    unix.MS_PRIVATE | unix.MS_REC,
+		"rshared":     unix.MS_SHARED | unix.MS_REC,
+		"rslave":      unix.MS_SLAVE | unix.MS_REC,
+		"runbindable": unix.MS_UNBINDABLE | unix.MS_REC,
 	}
 	extensionFlags := map[string]struct {
 		clear bool
@@ -682,7 +714,7 @@ func parseMountOptions(options []string) (int, []int, string, int) {
 	return flag, pgflag, strings.Join(data, ","), extFlags
 }
 
-func setupSeccomp(config *specs.Seccomp) (*configs.Seccomp, error) {
+func setupSeccomp(config *specs.LinuxSeccomp) (*configs.Seccomp, error) {
 	if config == nil {
 		return nil, nil
 	}
@@ -720,30 +752,30 @@ func setupSeccomp(config *specs.Seccomp) (*configs.Seccomp, error) {
 			return nil, err
 		}
 
-		newCall := configs.Syscall{
-			Name:   call.Name,
-			Action: newAction,
-			Args:   []*configs.Arg{},
-		}
-
-		// Loop through all the arguments of the syscall and convert them
-		for _, arg := range call.Args {
-			newOp, err := seccomp.ConvertStringToOperator(string(arg.Op))
-			if err != nil {
-				return nil, err
+		for _, name := range call.Names {
+			newCall := configs.Syscall{
+				Name:   name,
+				Action: newAction,
+				Args:   []*configs.Arg{},
 			}
+			// Loop through all the arguments of the syscall and convert them
+			for _, arg := range call.Args {
+				newOp, err := seccomp.ConvertStringToOperator(string(arg.Op))
+				if err != nil {
+					return nil, err
+				}
 
-			newArg := configs.Arg{
-				Index:    arg.Index,
-				Value:    arg.Value,
-				ValueTwo: arg.ValueTwo,
-				Op:       newOp,
+				newArg := configs.Arg{
+					Index:    arg.Index,
+					Value:    arg.Value,
+					ValueTwo: arg.ValueTwo,
+					Op:       newOp,
+				}
+
+				newCall.Args = append(newCall.Args, &newArg)
 			}
-
-			newCall.Args = append(newCall.Args, &newArg)
+			newConfig.Syscalls = append(newConfig.Syscalls, &newCall)
 		}
-
-		newConfig.Syscalls = append(newConfig.Syscalls, &newCall)
 	}
 
 	return newConfig, nil
@@ -751,17 +783,20 @@ func setupSeccomp(config *specs.Seccomp) (*configs.Seccomp, error) {
 
 func createHooks(rspec *specs.Spec, config *configs.Config) {
 	config.Hooks = &configs.Hooks{}
-	for _, h := range rspec.Hooks.Prestart {
-		cmd := createCommandHook(h)
-		config.Hooks.Prestart = append(config.Hooks.Prestart, configs.NewCommandHook(cmd))
-	}
-	for _, h := range rspec.Hooks.Poststart {
-		cmd := createCommandHook(h)
-		config.Hooks.Poststart = append(config.Hooks.Poststart, configs.NewCommandHook(cmd))
-	}
-	for _, h := range rspec.Hooks.Poststop {
-		cmd := createCommandHook(h)
-		config.Hooks.Poststop = append(config.Hooks.Poststop, configs.NewCommandHook(cmd))
+	if rspec.Hooks != nil {
+
+		for _, h := range rspec.Hooks.Prestart {
+			cmd := createCommandHook(h)
+			config.Hooks.Prestart = append(config.Hooks.Prestart, configs.NewCommandHook(cmd))
+		}
+		for _, h := range rspec.Hooks.Poststart {
+			cmd := createCommandHook(h)
+			config.Hooks.Poststart = append(config.Hooks.Poststart, configs.NewCommandHook(cmd))
+		}
+		for _, h := range rspec.Hooks.Poststop {
+			cmd := createCommandHook(h)
+			config.Hooks.Poststop = append(config.Hooks.Poststop, configs.NewCommandHook(cmd))
+		}
 	}
 }
 

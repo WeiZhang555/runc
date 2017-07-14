@@ -13,39 +13,36 @@ function teardown() {
 
 @test "runc run detached" {
   # run busybox detached
-  runc run -d --console /dev/pts/ptmx test_busybox
+  runc run -d --console-socket $CONSOLE_SOCKET test_busybox
   [ "$status" -eq 0 ]
 
   # check state
-  wait_for_container 15 1 test_busybox
-
   testcontainer test_busybox running
 }
 
 @test "runc run detached ({u,g}id != 0)" {
+  # cannot start containers as another user in rootless setup
+  requires root
+
   # replace "uid": 0 with "uid": 1000
   # and do a similar thing for gid.
   sed -i 's;"uid": 0;"uid": 1000;g' config.json
   sed -i 's;"gid": 0;"gid": 100;g' config.json
 
   # run busybox detached
-  runc run -d --console /dev/pts/ptmx test_busybox
+  runc run -d --console-socket $CONSOLE_SOCKET test_busybox
   [ "$status" -eq 0 ]
 
   # check state
-  wait_for_container 15 1 test_busybox
-
   testcontainer test_busybox running
 }
 
 @test "runc run detached --pid-file" {
   # run busybox detached
-  runc run --pid-file pid.txt -d --console /dev/pts/ptmx test_busybox
+  runc run --pid-file pid.txt -d --console-socket $CONSOLE_SOCKET test_busybox
   [ "$status" -eq 0 ]
 
   # check state
-  wait_for_container 15 1 test_busybox
-
   testcontainer test_busybox running
 
   # check pid.txt was generated
@@ -64,12 +61,10 @@ function teardown() {
   [ "$status" -eq 0 ]
 
   # run busybox detached
-  runc run --pid-file pid.txt -d  -b $BUSYBOX_BUNDLE --console /dev/pts/ptmx test_busybox
+  runc run --pid-file pid.txt -d  -b $BUSYBOX_BUNDLE --console-socket $CONSOLE_SOCKET test_busybox
   [ "$status" -eq 0 ]
 
   # check state
-  wait_for_container 15 1 test_busybox
-
   testcontainer test_busybox running
 
   # check pid.txt was generated

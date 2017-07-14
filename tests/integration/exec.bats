@@ -13,10 +13,8 @@ function teardown() {
 
 @test "runc exec" {
   # run busybox detached
-  runc run -d --console /dev/pts/ptmx test_busybox
+  runc run -d --console-socket $CONSOLE_SOCKET test_busybox
   [ "$status" -eq 0 ]
-
-  wait_for_container 15 1 test_busybox
 
   runc exec test_busybox echo Hello from exec
   [ "$status" -eq 0 ]
@@ -26,10 +24,8 @@ function teardown() {
 
 @test "runc exec --pid-file" {
   # run busybox detached
-  runc run -d --console /dev/pts/ptmx test_busybox
+  runc run -d --console-socket $CONSOLE_SOCKET test_busybox
   [ "$status" -eq 0 ]
-
-  wait_for_container 15 1 test_busybox
 
   runc exec --pid-file pid.txt test_busybox echo Hello from exec
   [ "$status" -eq 0 ]
@@ -53,10 +49,8 @@ function teardown() {
   [ "$status" -eq 0 ]
 
   # run busybox detached
-  runc run -d -b $BUSYBOX_BUNDLE --console /dev/pts/ptmx test_busybox
+  runc run -d -b $BUSYBOX_BUNDLE --console-socket $CONSOLE_SOCKET test_busybox
   [ "$status" -eq 0 ]
-
-  wait_for_container 15 1 test_busybox
 
   runc exec --pid-file pid.txt test_busybox echo Hello from exec
   [ "$status" -eq 0 ]
@@ -74,10 +68,8 @@ function teardown() {
 
 @test "runc exec ls -la" {
   # run busybox detached
-  runc run -d --console /dev/pts/ptmx test_busybox
+  runc run -d --console-socket $CONSOLE_SOCKET test_busybox
   [ "$status" -eq 0 ]
-
-  wait_for_container 15 1 test_busybox
 
   runc exec test_busybox ls -la
   [ "$status" -eq 0 ]
@@ -88,10 +80,8 @@ function teardown() {
 
 @test "runc exec ls -la with --cwd" {
   # run busybox detached
-  runc run -d --console /dev/pts/ptmx test_busybox
+  runc run -d --console-socket $CONSOLE_SOCKET test_busybox
   [ "$status" -eq 0 ]
-
-  wait_for_container 15 1 test_busybox
 
   runc exec --cwd /bin test_busybox pwd
   [ "$status" -eq 0 ]
@@ -100,10 +90,8 @@ function teardown() {
 
 @test "runc exec --env" {
   # run busybox detached
-  runc run -d --console /dev/pts/ptmx test_busybox
+  runc run -d --console-socket $CONSOLE_SOCKET test_busybox
   [ "$status" -eq 0 ]
-
-  wait_for_container 15 1 test_busybox
 
   runc exec --env RUNC_EXEC_TEST=true test_busybox env
   [ "$status" -eq 0 ]
@@ -112,11 +100,12 @@ function teardown() {
 }
 
 @test "runc exec --user" {
-  # run busybox detached
-  runc run -d --console /dev/pts/ptmx test_busybox
-  [ "$status" -eq 0 ]
+  # --user can't work in rootless containers
+  requires root
 
-  wait_for_container 15 1 test_busybox
+  # run busybox detached
+  runc run -d --console-socket $CONSOLE_SOCKET test_busybox
+  [ "$status" -eq 0 ]
 
   runc exec --user 1000:1000 test_busybox id
   [ "$status" -eq 0 ]
